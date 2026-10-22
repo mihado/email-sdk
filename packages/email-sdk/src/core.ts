@@ -31,7 +31,13 @@ import {
   validateFallback,
   validateRetry,
 } from "./core/routing.js";
-import { captureSendTelemetry, messageFacts, personalizedFacts } from "./core/send-telemetry.js";
+import { attemptStatus, classifyAttemptFailure } from "./core/failure-kind.js";
+import {
+  captureSendFailure,
+  captureSendTelemetry,
+  messageFacts,
+  personalizedFacts,
+} from "./core/send-telemetry.js";
 import {
   EmailAbortError,
   EmailAdapterError,
@@ -40,12 +46,7 @@ import {
   EmailRouteError,
   EmailValidationError,
 } from "./errors.js";
-import {
-  getTelemetry,
-  getTelemetrySource,
-  isReportableSendError,
-  normalizeAdapterName,
-} from "./telemetry.js";
+import { getTelemetry, getTelemetrySource, normalizeAdapterName } from "./telemetry.js";
 import { isTestAdapter } from "./testing.js";
 import type {
   EmailAdapter,
@@ -61,10 +62,12 @@ import type {
   EmailSendMiddleware,
   EmailSendOptions,
   EmailSendResult,
+  EmailRetryConfig,
   EmailSendSettledResult,
   EmailValidationResult,
 } from "./types.js";
-import { arrayify, assertMessage } from "./utils.js";
+import { isObjectLike } from "./internal/decode.js";
+import { arrayify, assertMessage, isBuiltInAdapter } from "./utils.js";
 
 export function createEmailClient<
   const TAdapters extends readonly EmailAdapter[],
@@ -170,6 +173,10 @@ export function createEmailClient<
       const notSent = adapterError?.delivery === "not_sent" && accepted === 0;
       const unknownRecipients = notSent ? 0 : Math.max(0, recipients - accepted - rejected);
       void telemetry?.capture("email adapter attempted", {
+        failure_kind: resolved
+          ? undefined
+          : classifyAttemptFailure(adapter.name, failure),
+        http_status: resolved ? undefined : attemptStatus(adapter.name, failure),
         measurement_schema_version: 2,
         measurement_scope: "adapter_attempt",
         adapter: adapterName,
@@ -200,6 +207,41 @@ export function createEmailClient<
     }
   };
 
+  // Caller callbacks (adapter validate hooks, retry shouldRetry and delay) run
+  // inside SDK code, so their throws get filed under a built-in adapter or
+  // "unknown". They are remembered here to keep them out of error tracking.
+  const callerErrors = new WeakSet<object>();
+
+  const callerOwned = <Result>(run: () => Result): Result => {
+    try {
+      return run();
+    } catch (error) {
+      if (isObjectLike(error)) callerErrors.add(error);
+
+      throw error;
+    }
+  };
+
+  const callerRetry = (retry: EmailRetryConfig | undefined): EmailRetryConfig | undefined => {
+    if (!retry) return retry;
+    const { shouldRetry, delay } = retry;
+
+    return {
+      ...retry,
+      shouldRetry: shouldRetry && ((error, attempt) => callerOwned(() => shouldRetry(error, attempt))),
+      delay: delay && ((attempt, error) => callerOwned(() => delay(attempt, error))),
+    };
+  };
+
+  const isSdkOwned = (failure: EmailAdapterError) => {
+    if (isObjectLike(failure.cause) && callerErrors.has(failure.cause)) return false;
+
+    // "unknown" is core's own label, unless a caller registered an adapter by that name.
+    if (failure.adapter === "unknown" && !adapters.has("unknown")) return true;
+
+    return isBuiltInAdapter(adapters.get(failure.adapter));
+  };
+
   void telemetry?.capture("client created", {
     adapters: [...adapters.keys()].map(normalizeAdapterName),
     adapter_count: adapters.size,
@@ -221,7 +263,14 @@ export function createEmailClient<
     for (const name of route.names) {
       const adapter = requireAdapter(adapters, name);
       validateCapabilities(adapter, message, operation);
-      await adapter.validate?.(message, { adapter: name, operation });
+
+      try {
+        await adapter.validate?.(message, { adapter: name, operation });
+      } catch (error) {
+        if (!isBuiltInAdapter(adapter) && isObjectLike(error)) callerErrors.add(error);
+
+        throw error;
+      }
     }
 
     return { adapter: route.primary, warnings: [] };
@@ -254,7 +303,7 @@ export function createEmailClient<
             adapter,
             message: prepared.message,
             options: prepared.options,
-            retry: prepared.options?.retry ?? options.retry,
+            retry: callerRetry(prepared.options?.retry ?? options.retry),
             hooks,
             middleware,
             measureAttempt,
@@ -306,25 +355,16 @@ export function createEmailClient<
       throw new EmailRouteError(failures);
     } catch (error) {
       const normalized = normalizeOwnedError(error);
-      const attemptedAdapter = sendOptions?.adapter ?? defaultAdapter;
-      captureSendTelemetry({
+      captureSendFailure({
         telemetry,
         source: telemetrySource,
         startedAt,
         facts,
-        adapter: attemptedAdapter,
-        success: false,
+        adapter: sendOptions?.adapter ?? defaultAdapter,
         messageCount: 1,
-        errorCode: normalized.code,
+        error: normalized,
+        isSdkOwned,
       });
-
-      if (telemetry && isReportableSendError(normalized)) {
-        void telemetry.captureException(normalized, {
-          source: telemetrySource,
-          handled: true,
-          adapter: normalizeAdapterName(attemptedAdapter),
-        });
-      }
 
       throw normalized;
     }
@@ -420,6 +460,15 @@ export function createEmailClient<
 
       const routeFailures: EmailAdapterError[] = [];
 
+      // The helpers pick per-send retry over the client's, so both are wrapped
+      // and the choice between them is left alone.
+      const attemptOptions = prepared.options && {
+        ...prepared.options,
+        retry: callerRetry(prepared.options.retry),
+      };
+
+      const clientRetry = callerRetry(options.retry);
+
       for (const [index, name] of route.names.entries()) {
         const adapter = requireAdapter(adapters, name);
         deliveryPath = adapter.sendPersonalized ? "personalized_native" : "personalized_expanded";
@@ -429,8 +478,8 @@ export function createEmailClient<
               adapter,
               preparedInput,
               expanded[0]!.message,
-              prepared.options,
-              options.retry,
+              attemptOptions,
+              clientRetry,
               hooks,
               middleware,
               measureAttempt,
@@ -438,8 +487,8 @@ export function createEmailClient<
           : await attemptExpandedPersonalized(
               adapter,
               expanded,
-              prepared.options,
-              options.retry,
+              attemptOptions,
+              clientRetry,
               hooks,
               middleware,
               measureAttempt,
@@ -474,25 +523,17 @@ export function createEmailClient<
       throw new EmailAllRecipientsFailedError(routeFailures);
     } catch (error) {
       const normalized = normalizeOwnedError(error);
-      captureSendTelemetry({
+      captureSendFailure({
         telemetry,
         source: telemetrySource,
         startedAt,
         facts,
         adapter: attemptedAdapter,
-        success: false,
         messageCount: facts.recipients,
-        errorCode: normalized.code,
+        error: normalized,
+        isSdkOwned,
         deliveryPath,
       });
-
-      if (telemetry && isReportableSendError(normalized)) {
-        void telemetry.captureException(normalized, {
-          source: telemetrySource,
-          handled: true,
-          adapter: normalizeAdapterName(attemptedAdapter),
-        });
-      }
 
       throw normalized;
     }
