@@ -1,0 +1,80 @@
+name: Analyze new issues
+
+# Hands each newly opened issue to a T3 agent thread that checks it against the
+# code and reports to the maintainer. The agent only reads: it never comments,
+# labels, or closes anything here. Bots (including Linear's issue sync) and the
+# maintainer's own issues are skipped, and each author gets at most three
+# analyses a day so a spammer can't start unlimited agent runs. The count
+# includes the issue that triggered this run. The per-author concurrency group keeps only one queued run per
+# author and cancels the rest of a burst.
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: read
+
+concurrency:
+  group: issue-analysis-${{ github.event.issue.user.login }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: Send to the analysis agent
+    if: github.event.issue.user.type != 'Bot' && github.event.issue.user.login != 'leoisadev1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Skip authors who opened more than three issues today
+        id: budget
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+          QUERY: |
+            query($owner: String!, $name: String!, $author: String!, $since: DateTime!) {
+              repository(owner: $owner, name: $name) {
+                issues(
+                  first: 100
+                  filterBy: { createdBy: $author, since: $since }
+                  orderBy: { field: CREATED_AT, direction: DESC }
+                ) {
+                  nodes { createdAt }
+                }
+              }
+            }
+        run: |
+          set -euo pipefail
+          since="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+          # GraphQL reads the issue list directly; search and the REST list can
+          # lag or miss issues. `since` filters on updated time, so keep only
+          # issues created since then. Newest first, so the first 100 always
+          # hold the new ones; only "more than 3" matters.
+          opened="$(gh api graphql \
+            -f owner="${GITHUB_REPOSITORY_OWNER}" -f name="${GITHUB_REPOSITORY#*/}" \
+            -f author="${AUTHOR}" -f since="${since}" -f query="${QUERY}" \
+            --jq "[.data.repository.issues.nodes[] | select(.createdAt >= \"${since}\")] | length")"
+          echo "Issues opened by this author in the last 24 hours: ${opened}"
+          # Anything but a plain count (an API shape change) fails closed.
+          if ! [[ "${opened}" =~ ^[0-9]+$ ]] || [ "${opened}" -gt 3 ]; then
+            echo "::notice::Daily analysis budget used up for this author; skipping."
+            echo "send=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "send=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post the issue to the T3 webhook
+        if: steps.budget.outputs.send == 'true'
+        env:
+          WEBHOOK_URL: ${{ secrets.T3_ISSUE_ANALYSIS_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "::notice::T3_ISSUE_ANALYSIS_WEBHOOK_URL is not set; skipping."
+            exit 0
+          fi
+          # The issue text is untrusted, so it is read from the event file as
+          # data and never interpolated into the script. Reading the file also
+          # avoids the per-variable size limit a long issue body would hit.
+          jq -c .issue "${GITHUB_EVENT_PATH}" | curl -fsS --max-time 30 -X POST "${WEBHOOK_URL}" \
+            -H 'Content-Type: application/json' --data-binary @- -o /dev/null
+          echo "Sent issue #$(jq .issue.number "${GITHUB_EVENT_PATH}") for analysis."
