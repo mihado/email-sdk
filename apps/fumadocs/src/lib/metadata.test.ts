@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 
-import { buildDocsStructuredData, homeStructuredData, siteImageAlt, siteMeta, siteTitle } from "@/lib/metadata";
+import {
+  buildDocsStructuredData,
+  homeStructuredData,
+  rootMetaFor,
+  siteImageAlt,
+  siteMeta,
+  siteTitle,
+  siteVideoMeta,
+} from "@/lib/metadata";
 import { providers } from "@/lib/providers";
 import { appDescription, llmsOverview, siteOgImageUrl } from "@/lib/shared";
 
@@ -31,6 +39,34 @@ describe("site social metadata", () => {
     const imageUrl = new URL(siteOgImageUrl);
     expect(imageUrl.pathname).toBe("/og/email-sdk.png");
     expect(imageUrl.searchParams.get("v")).toMatch(/\S+/);
+  });
+
+  test("describes the animated preview with absolute production video URLs", () => {
+    const videoTags = Object.fromEntries(siteVideoMeta.map((meta) => [meta.property, meta.content]));
+
+    expect(videoTags).toEqual({
+      "og:video": "https://email-sdk.dev/og/og-video.mp4",
+      "og:video:secure_url": "https://email-sdk.dev/og/og-video.mp4",
+      "og:video:type": "video/mp4",
+      "og:video:width": "2400",
+      "og:video:height": "1260",
+    });
+    expect(existsSync(new URL("../../public/og/og-video.mp4", import.meta.url))).toBe(true);
+    // The root route adds the video separately so pages with their own card can skip it.
+    expect(findByProperty("og:video")).toHaveLength(0);
+    expect(findByName("twitter:player")).toHaveLength(0);
+  });
+
+  test("adds the video only on pages that use the site-wide card", () => {
+    const videoTagsFor = (routeId: string) =>
+      rootMetaFor({ routeIds: ["__root__", routeId] }).filter(
+        (meta) => "property" in meta && meta.property?.startsWith("og:video") === true,
+      );
+
+    expect(videoTagsFor("/")).toEqual(siteVideoMeta);
+    expect(videoTagsFor("/docs/$")).toEqual(siteVideoMeta);
+    expect(videoTagsFor("/blog/$slug")).toHaveLength(0);
+    expect(videoTagsFor("/compare/$pair")).toHaveLength(0);
   });
 
   test("keeps the Twitter preview on the large image card", () => {
