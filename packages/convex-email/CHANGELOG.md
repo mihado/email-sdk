@@ -1,5 +1,28 @@
 # @opencoredev/convex-email
 
+## 7.0.0
+
+### Patch Changes
+
+- e2a2f64: The sender action passes `idempotency: "best-effort"` with each email's `idempotencyKey`. The component already deduplicates by that key, so emails keep sending through adapters without provider-side idempotency, such as SendGrid or SES, when `@opencoredev/email-sdk` rejects a strict key on those adapters.
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [445d658]
+- Updated dependencies [e2a2f64]
+- Updated dependencies [e2a2f64]
+  - @opencoredev/email-sdk@4.0.0
+
 ## 6.0.0
 
 ### Major Changes
